@@ -19,7 +19,7 @@ with left:
         st.image(LOGO_FILE, use_container_width=True)
 with right:
     st.title(APP_TITLE)
-    st.caption("Procesa resúmenes de tarjetas (Cabal / Visa / Mastercard / Maestro) de cualquier banco")
+    st.caption("Procesa resúmenes de tarjetas (Cabal / Visa / Mastercard / Maestro / American Express) de cualquier banco")
 
 st.markdown('<hr style="margin:8px 0 20px 0;">', unsafe_allow_html=True)
 
