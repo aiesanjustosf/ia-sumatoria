@@ -18,7 +18,7 @@ with left:
         st.image(LOGO_FILE, use_container_width=True)
 with right:
     st.title(APP_TITLE)
-    st.caption("Procesa resúmenes de tarjetas (Cabal / Visa / Mastercard / Maestro / American Express) de cualquier banco")
+    st.caption("Procesa resúmenes de tarjetas (Cabal / Visa / Mastercard / Maestro) de cualquier banco")
 
 st.markdown('<hr style="margin:8px 0 20px 0;">', unsafe_allow_html=True)
 
@@ -38,7 +38,7 @@ if st.button("Procesar y generar resumen") and pdf_file is not None:
         with st.spinner("Procesando..."):
             resumen = extract_resumen_from_bytes(pdf_file.getvalue())
 
-            # Ocultar '-IVA ...' si apareciera (o variantes), solo visualmente
+            # Ocultar '-IVA ...' si apareciera (o variantes), sólo en vista
             if "Concepto" in resumen.columns:
                 mask_menos_iva = resumen["Concepto"].str.contains(r"^\s*[−-]\s*IVA\b", flags=re.IGNORECASE, regex=True)
                 resumen_vista = resumen.loc[~mask_menos_iva].reset_index(drop=True)
@@ -55,8 +55,18 @@ if st.button("Procesar y generar resumen") and pdf_file is not None:
 
             if gen_pdf:
                 out_path = "IA_sumatoria.pdf"
-                build_report_pdf(resumen_vista, out_path,
-                                 titulo="IA AIE - Control tarjetas crédito/débito",
-                                 agregar_total_general=True)
+                build_report_pdf(
+                    resumen_vista, out_path,
+                    titulo="IA AIE - Control tarjetas crédito/débito",
+                    agregar_total_general=True
+                )
                 with open(out_path, "rb") as f:
                     st.download_button("⬇️ Descargar informe PDF", f, file_name=out_path, mime="application/pdf")
+
+# Pie institucional SOLO en frontend (no en el PDF)
+st.markdown(
+    '<div style="margin-top:24px;text-align:center;color:#666;font-size:12px;">'
+    '© AIE – Herramienta para uso interno | Developer Alfonso Alderete'
+    '</div>',
+    unsafe_allow_html=True
+)
