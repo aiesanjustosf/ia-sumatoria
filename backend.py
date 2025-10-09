@@ -47,9 +47,15 @@ RX_IVA21_RI_DTO_FOT = re.compile(
     r"([\-−]?\d{1,3}(?:\.\d{3})*,\d{2})",
     re.IGNORECASE
 )
-# NUEVO: IVA RI SERV.OPER. INT.  → suma a 21%
+# NUEVO: IVA RI SERV.OPER. INT.  → suma a 21% (ya lo estabas sumando)
 RX_IVA21_RI_SERV_INT = re.compile(
     r"(IVA\s*RI\s*SERV\.?\s*OPER\.?\s*INT\.?)[^\d\-−]{0,120}"
+    r"([\-−]?\d{1,3}(?:\.\d{3})*,\d{2})",
+    re.IGNORECASE
+)
+# NUEVO: IVA RI SIST CUOTAS  → suma a 21% (PARCHE)
+RX_IVA21_RI_SIST_CUOTAS = re.compile(
+    r"(IVA\s*RI\s*SIST\s*CUOTAS)[^\d\-−]{0,120}"
     r"([\-−]?\d{1,3}(?:\.\d{3})*,\d{2})",
     re.IGNORECASE
 )
@@ -72,22 +78,46 @@ RX_PERC_IVA_15 = re.compile(
     re.IGNORECASE
 )
 
+# NUEVO: Otras percepciones IVA (QR PERCEPCION IVA 3337)
+RX_PERC_IVA_QR3337 = re.compile(
+    r"QR\s*PERCEPCION\s*IVA\s*3337[^\d\-−]*(\-?\d{1,3}(?:\.\d{3})*,\d{2})",
+    re.IGNORECASE
+)
+
+# NUEVO: Gastos exentos (CARGO TERMINAL FISERV)
+RX_GASTO_TERMINAL_FISERV = re.compile(
+    r"CARGO\s*TERMINAL\s*FISERV[^\d\-−]*(\-?\d{1,3}(?:\.\d{3})*,\d{2})",
+    re.IGNORECASE
+)
+
 # Retenciones universales
 RX_RET_IIBB = re.compile(r"RETENCION\s*ING\.?\s*BRUTOS[^\d\-−]*(\-?\d{1,3}(?:\.\d{3})*,\d{2})", re.IGNORECASE)
 RX_RET_IVA  = re.compile(r"RETENCI[ÓO]N\s*IVA[^\d\-−]*(\-?\d{1,3}(?:\.\d{3})*,\d{2})", re.IGNORECASE)
 RX_RET_GCIAS= re.compile(r"RETENCI[ÓO]N\s*(IMP\.?\s*GANANCIAS|GANANCIAS)[^\d\-−]*(\-?\d{1,3}(?:\.\d{3})*,\d{2})", re.IGNORECASE)
 
 def extract_universal(text: str) -> dict:
-    tot = {"iva21": 0.0, "iva105": 0.0, "perc_30": 0.0, "perc_15": 0.0, "ret_iibb": 0.0, "ret_iva": 0.0, "ret_gcias": 0.0}
-    for m in RX_IVA21_ANY.finditer(text):         tot["iva21"] += to_float_signed(m.group(2))
-    for m in RX_IVA21_RI_DTO_FOT.finditer(text):  tot["iva21"] += to_float_signed(m.group(2))
-    for m in RX_IVA21_RI_SERV_INT.finditer(text): tot["iva21"] += to_float_signed(m.group(2))  # ← NUEVO
-    for m in RX_IVA105.finditer(text):            tot["iva105"] += to_float_signed(m.group(2))
-    for m in RX_PERC_IVA_30.finditer(text):       tot["perc_30"] += to_float_signed(m.group(1))
-    for m in RX_PERC_IVA_15.finditer(text):       tot["perc_15"] += to_float_signed(m.group(1))
-    for m in RX_RET_IIBB.finditer(text):          tot["ret_iibb"] += to_float_signed(m.group(1))
-    for m in RX_RET_IVA.finditer(text):           tot["ret_iva"]  += to_float_signed(m.group(1))
-    for m in RX_RET_GCIAS.finditer(text):         tot["ret_gcias"]+= to_float_signed(m.group(2))
+    # PARCHE: agrego 'perc_qr3337' y 'gasto_fiserv', y SIST CUOTAS dentro de iva21.
+    tot = {
+        "iva21": 0.0, "iva105": 0.0,
+        "perc_30": 0.0, "perc_15": 0.0,
+        "perc_qr3337": 0.0, "gasto_fiserv": 0.0,   # << nuevos
+        "ret_iibb": 0.0, "ret_iva": 0.0, "ret_gcias": 0.0
+    }
+    for m in RX_IVA21_ANY.finditer(text):            tot["iva21"] += to_float_signed(m.group(2))
+    for m in RX_IVA21_RI_DTO_FOT.finditer(text):     tot["iva21"] += to_float_signed(m.group(2))
+    for m in RX_IVA21_RI_SERV_INT.finditer(text):    tot["iva21"] += to_float_signed(m.group(2))
+    for m in RX_IVA21_RI_SIST_CUOTAS.finditer(text): tot["iva21"] += to_float_signed(m.group(2))  # << NUEVO
+    for m in RX_IVA105.finditer(text):               tot["iva105"] += to_float_signed(m.group(2))
+
+    for m in RX_PERC_IVA_30.finditer(text):          tot["perc_30"] += to_float_signed(m.group(1))
+    for m in RX_PERC_IVA_15.finditer(text):          tot["perc_15"] += to_float_signed(m.group(1))
+
+    for m in RX_PERC_IVA_QR3337.finditer(text):      tot["perc_qr3337"] += to_float_signed(m.group(1))  # << NUEVO
+    for m in RX_GASTO_TERMINAL_FISERV.finditer(text):tot["gasto_fiserv"] += to_float_signed(m.group(1)) # << NUEVO
+
+    for m in RX_RET_IIBB.finditer(text):             tot["ret_iibb"] += to_float_signed(m.group(1))
+    for m in RX_RET_IVA.finditer(text):              tot["ret_iva"]  += to_float_signed(m.group(1))
+    for m in RX_RET_GCIAS.finditer(text):            tot["ret_gcias"]+= to_float_signed(m.group(2))
     return {k: round(v, 2) for k, v in tot.items()}
 
 # ============ Router + Consolidación ============
@@ -96,7 +126,10 @@ def extract_resumen_from_bytes(pdf_bytes: bytes) -> pd.DataFrame:
     with open(tmp_path, "wb") as f: f.write(pdf_bytes)
 
     cabal_tot = {"iva_arancel": 0.0, "iva_costo": 0.0, "percep_rg333": 0.0, "ret_iibb": 0.0, "menos_iva": 0.0}
-    uni_tot   = {"iva21": 0.0, "iva105": 0.0, "perc_30": 0.0, "perc_15": 0.0, "ret_iibb": 0.0, "ret_iva": 0.0, "ret_gcias": 0.0}
+    # PARCHE: uni_tot incorpora perc_qr3337 y gasto_fiserv
+    uni_tot   = {"iva21": 0.0, "iva105": 0.0, "perc_30": 0.0, "perc_15": 0.0,
+                 "perc_qr3337": 0.0, "gasto_fiserv": 0.0,
+                 "ret_iibb": 0.0, "ret_iva": 0.0, "ret_gcias": 0.0}
     saw_cabal = False
 
     with pdfplumber.open(tmp_path) as pdf:
@@ -111,21 +144,26 @@ def extract_resumen_from_bytes(pdf_bytes: bytes) -> pd.DataFrame:
                 for k in uni_tot:   uni_tot[k] += page_uni[k]
 
     if saw_cabal:
-        # ÚNICA MODIFICACIÓN: sumar 'menos_iva' al total de IVA 21%
+        # ÚNICA MODIFICACIÓN: sumar 'menos_iva' (gasto -IVA 21%) al total de IVA 21%
         iva21   = round(cabal_tot["iva_arancel"] + cabal_tot["menos_iva"], 2)
         base21  = round(iva21 / 0.21, 2) if iva21 else 0.0
         iva105  = round(cabal_tot["iva_costo"], 2)
         base105 = round(iva105 / 0.105, 2) if iva105 else 0.0
         percep  = round(cabal_tot["percep_rg333"], 2)
-        ret_iibb= round(cabal_tot["ret_iibb"], 2)
-        ret_iva = 0.0
-        ret_gcs = 0.0
+        # PARCHE: aún si hubo páginas Cabal, acumulamos otras percepciones / gastos exentos si aparecieron en páginas universales
+        otras_perc_iva = round(uni_tot["perc_qr3337"], 2)
+        gastos_exentos = round(uni_tot["gasto_fiserv"], 2)
+        ret_iibb= round(cabal_tot["ret_iibb"] + uni_tot["ret_iibb"], 2)  # mantiene tu suma de IBB (sin perder universal)
+        ret_iva = round(uni_tot["ret_iva"], 2)
+        ret_gcs = round(uni_tot["ret_gcias"], 2)
     else:
         iva21   = round(uni_tot["iva21"], 2)
         base21  = round(iva21 / 0.21, 2) if iva21 else 0.0
         iva105  = round(uni_tot["iva105"], 2)
         base105 = round(iva105 / 0.105, 2) if iva105 else 0.0
         percep  = round(uni_tot["perc_30"] + uni_tot["perc_15"], 2)
+        otras_perc_iva = round(uni_tot["perc_qr3337"], 2)   # << NUEVO
+        gastos_exentos = round(uni_tot["gasto_fiserv"], 2)  # << NUEVO
         ret_iibb= round(uni_tot["ret_iibb"], 2)
         ret_iva = round(uni_tot["ret_iva"], 2)
         ret_gcs = round(uni_tot["ret_gcias"], 2)
@@ -135,9 +173,17 @@ def extract_resumen_from_bytes(pdf_bytes: bytes) -> pd.DataFrame:
             "Base Neto 21%", "IVA 21% (Total)",
             "Base Neto 10,5%", "IVA 10,5% (Total)",
             "Percepciones IVA (Total)",
+            "Otras per. de IVA",          # << NUEVO
+            "Gastos Exentos",             # << NUEVO
             "Retenciones IBB", "Retenciones IVA", "Retenciones Ganancias",
         ],
-        "Monto Total": [base21, iva21, base105, iva105, percep, ret_iibb, ret_iva, ret_gcs],
+        "Monto Total": [
+            base21, iva21,
+            base105, iva105,
+            percep,
+            otras_perc_iva, gastos_exentos,   # << NUEVOS totales
+            ret_iibb, ret_iva, ret_gcs
+        ],
     })
     return resumen
 
@@ -179,5 +225,3 @@ def build_report_pdf(resumen_df: pd.DataFrame, out_path: str, titulo: str, agreg
 
     doc.build(story)
     return out_path
-
-
