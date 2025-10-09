@@ -1,72 +1,106 @@
-import os
-import re
+# app.py
+# — IA AIE · Sumatoria de resúmenes — Alfonso A.
+# Interfaz Streamlit. Sube PDFs, procesa con backend.procesar_pdfs y muestra la grilla.
+import io
+import base64
 import streamlit as st
-from backend import extract_resumen_from_bytes, build_report_pdf, format_money
+import pandas as pd
 
-APP_TITLE = "IA AIE - Control tarjetas crédito/débito"
-PAGE_ICON = "favicon.ico"
-LOGO_FILE = "logo_aie.png"
-MAX_MB    = 50
+from backend import procesar_pdfs
 
-st.set_page_config(page_title=APP_TITLE,
-                   page_icon=PAGE_ICON if os.path.exists(PAGE_ICON) else None,
-                   layout="centered")
-
-left, right = st.columns([1, 3])
-with left:
-    if os.path.exists(LOGO_FILE):
-        st.image(LOGO_FILE, use_container_width=True)
-with right:
-    st.title(APP_TITLE)
-    st.caption("Procesa resúmenes de tarjetas (Cabal / Visa / Mastercard / Maestro) de cualquier banco")
-
-st.markdown('<hr style="margin:8px 0 20px 0;">', unsafe_allow_html=True)
-
-pdf_file = st.file_uploader("📄 PDF de resumen de tarjeta", type=["pdf"])
-
-col1, col2 = st.columns(2)
-with col1:
-    gen_pdf = st.checkbox("Generar informe PDF", value=True)
-with col2:
-    show_table = st.checkbox("Mostrar tabla en pantalla", value=True)
-
-if st.button("Procesar y generar resumen") and pdf_file is not None:
-    size_mb = len(pdf_file.getvalue()) / (1024 * 1024)
-    if size_mb > MAX_MB:
-        st.error(f"El archivo supera {MAX_MB} MB.")
-    else:
-        with st.spinner("Procesando..."):
-            resumen = extract_resumen_from_bytes(pdf_file.getvalue())
-
-            # Ocultar '-IVA ...' si apareciera (o variantes), sólo en vista
-            if "Concepto" in resumen.columns:
-                mask_menos_iva = resumen["Concepto"].str.contains(r"^\s*[−-]\s*IVA\b", flags=re.IGNORECASE, regex=True)
-                resumen_vista = resumen.loc[~mask_menos_iva].reset_index(drop=True)
-            else:
-                resumen_vista = resumen.copy()
-
-            df_display = resumen_vista.copy()
-            if "Monto Total" in df_display.columns:
-                df_display["Monto Total"] = df_display["Monto Total"].apply(format_money)
-
-            if show_table:
-                st.subheader("Resumen de importes")
-                st.dataframe(df_display, use_container_width=True)
-
-            if gen_pdf:
-                out_path = "IA_sumatoria.pdf"
-                build_report_pdf(
-                    resumen_vista, out_path,
-                    titulo="IA AIE - Control tarjetas crédito/débito",
-                    agregar_total_general=True
-                )
-                with open(out_path, "rb") as f:
-                    st.download_button("⬇️ Descargar informe PDF", f, file_name=out_path, mime="application/pdf")
-
-# Pie institucional SOLO en frontend (no en el PDF)
-st.markdown(
-    '<div style="margin-top:24px;text-align:center;color:#666;font-size:12px;">'
-    '© AIE – Herramienta para uso interno | Developer Alfonso Alderete'
-    '</div>',
-    unsafe_allow_html=True
+st.set_page_config(
+    page_title="IA AIE – Sumatorias",
+    page_icon="favicon.ico",
+    layout="centered",
 )
+
+# Header
+col1, col2 = st.columns([1, 5], vertical_alignment="center")
+with col1:
+    st.image("logo_aie.png", use_container_width=True)
+with col2:
+    st.markdown("## Sumatorias de resúmenes de tarjetas de crédito")
+
+st.divider()
+
+# Opciones
+c1, c2 = st.columns(2)
+with c1:
+    gen_pdf = st.checkbox("Generar informe PDF", value=True)
+with c2:
+    ver_tabla = st.checkbox("Mostrar tabla en pantalla", value=True)
+
+# Upload
+files = st.file_uploader(
+    "Subí los resúmenes (PDF) — podés arrastrar varios",
+    type=["pdf"], accept_multiple_files=True
+)
+
+btn = st.button("Procesar y generar resumen", type="primary", use_container_width=False)
+
+def _df_to_csv_download(df: pd.DataFrame, filename: str, label: str):
+    csv = df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        label=label,
+        data=csv,
+        file_name=filename,
+        mime="text/csv",
+        use_container_width=False
+    )
+
+if btn:
+    if not files:
+        st.warning("Subí al menos un PDF.")
+        st.stop()
+
+    file_bytes_list = [f.read() for f in files]
+    resumen, detalle = procesar_pdfs(file_bytes_list)
+
+    st.markdown("### Resumen de importes")
+    if ver_tabla:
+        st.dataframe(
+            resumen.style.format({"Monto Total": lambda x: f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")}),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    # Descargas
+    _df_to_csv_download(resumen, "resumen_importes.csv", "Descargar resumen (CSV)")
+    _df_to_csv_download(detalle, "detalle_movimientos.csv", "Descargar detalle (CSV)")
+
+    # Comprobante simple en PDF (opcional)
+    if gen_pdf:
+        try:
+            import reportlab
+            from reportlab.lib.pagesizes import A4
+            from reportlab.pdfgen import canvas
+
+            buf = io.BytesIO()
+            c = canvas.Canvas(buf, pagesize=A4)
+            width, height = A4
+
+            c.setFont("Helvetica-Bold", 14)
+            c.drawString(40, height - 40, "IA AIE – Resumen de importes")
+            c.setFont("Helvetica", 10)
+
+            y = height - 80
+            for _, row in resumen.iterrows():
+                c.drawString(40, y, str(row["Concepto"]))
+                c.drawRightString(width - 40, y, f'{row["Monto Total"]:,.2f}'.replace(",", "X").replace(".", ",").replace("X", "."))
+                y -= 16
+                if y < 60:
+                    c.showPage(); y = height - 60
+                    c.setFont("Helvetica", 10)
+
+            c.showPage()
+            c.save()
+            pdf_bytes = buf.getvalue()
+            st.download_button(
+                "Descargar informe PDF",
+                data=pdf_bytes,
+                file_name="informe_sumatoria.pdf",
+                mime="application/pdf"
+            )
+        except Exception as e:
+            st.info("El PDF no pudo generarse en este entorno. Podés usar los CSV descargados.")
+
