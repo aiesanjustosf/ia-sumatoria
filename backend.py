@@ -1,181 +1,191 @@
+# backend.py
+# — IA AIE · Sumatoria de resúmenes — Alfonso A.
+# Procesa PDFs (Visa/Master/Cabal/Fiserv), arma un detalle y una grilla-resumen.
+# Ajustes pedidos:
+#  - IVA 21% (Total) incluye: IVA RI SERV.OPER. INT. + IVA RI SIST CUOTAS + cualquier IVA 21%
+#  - Nuevas filas en grilla: "Otras per. de IVA" (QR PERCEPCION IVA 3337) y "Gastos Exentos" (CARGO TERMINAL FISERV)
+#  - Se mantienen las filas de Neto (no se eliminan)
+
+from __future__ import annotations
+import io
 import re
-import datetime
 import pdfplumber
 import pandas as pd
-from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib import colors
+from typing import List, Tuple
 
-# ============ Utils ============
-def to_float_signed(s: str) -> float:
-    s = (s or "").strip().replace("−", "-")
-    return float(s.replace(".", "").replace(",", "."))
+# =========================
+# Utilidades
+# =========================
+AMOUNT_RX = r"-?\s?\d{1,3}(?:\.\d{3})*,\d{2}"
 
-def format_money(x: float) -> str:
-    return f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+def _to_float(s: str) -> float:
+    if not isinstance(s, str):
+        return float(s or 0)
+    s = s.replace("−", "-").replace(" ", "")
+    s = s.replace(".", "").replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
 
-# ============ CABAL (exacto, tu lógica validada) ============
-CABAL_PATTERNS = {
-    "IVA_ARANCEL_21": re.compile(r"IVA S/ARANCEL DE DESCUENTO\s+21,00%.*?([\d.]+,\d{2})\s*[-−]"),
-    "IVA_COSTO_10_5": re.compile(r"IVA S/COSTO FINANCIERO\s+10,50%.*?([\d.]+,\d{2})\s*[-−]"),
-    "PERCEPCION_RG333": re.compile(r"PERCEPCION DE IVA RG 333.*?([\d.]+,\d{2})\s*[-−]"),
-    "RETENCION_IB": re.compile(r"RETENCION DE INGRESOS BR.*?([\d.]+,\d{2})\s*[-−]"),
-    "MENOS_IVA_21": re.compile(r"[-−]IVA\s+21,00%.*?([\d.]+,\d{2})\s*[-−]"),
-}
+def _sum(df: pd.DataFrame, rx: re.Pattern) -> float:
+    if df.empty:
+        return 0.0
+    m = df["Concepto"].fillna("").str.contains(rx, na=False)
+    return float(df.loc[m, "Monto Total"].sum())
 
-def extract_cabal_exact(text: str) -> dict:
-    tot = {"iva_arancel": 0.0, "iva_costo": 0.0, "percep_rg333": 0.0, "ret_iibb": 0.0, "menos_iva": 0.0}
-    for key, rx in CABAL_PATTERNS.items():
-        for m in rx.finditer(text):
-            val = to_float_signed(m.group(1))
-            if key == "IVA_ARANCEL_21": tot["iva_arancel"] += val
-            elif key == "IVA_COSTO_10_5": tot["iva_costo"] += val
-            elif key == "PERCEPCION_RG333": tot["percep_rg333"] += val
-            elif key == "RETENCION_IB": tot["ret_iibb"] += val
-            elif key == "MENOS_IVA_21": tot["menos_iva"] += val
+def _find_all_amounts(text: str, rx: re.Pattern) -> float:
+    total = 0.0
+    for m in rx.finditer(text):
+        total += _to_float(m.group(1))
+    return total
+
+# =========================
+# Patrones conceptuales
+# =========================
+# IVA 21%: general + especificos (pedidos)
+RX_IVA21_GENERIC = re.compile(rf"IVA[^\n]{{0,120}}21[,\.]?\s*%", re.I)
+RX_IVA21_SERV_INT = re.compile(r"IVA\s*RI\s*SERV\.?\s*OPER\.?\s*INT\.?", re.I)
+RX_IVA21_SIST_CUOTAS = re.compile(r"IVA\s*RI\s*SIST\s*CUOTAS", re.I)  # << NUEVO (pedidos)
+
+# IVA 10,5%
+RX_IVA105_GENERIC = re.compile(r"(IVA[^\n]{0,120}10[,\.]?\s*5\s*%|10,50%)", re.I)
+
+# Percepciones IVA RG 2408 (1,5 / 3,0)
+RX_PERC_IVA_RG2408 = re.compile(r"PERCEPCI[ÓO]N\s*IVA\s*(?:RG|R\.?\s*G\.?)\s*2408", re.I)
+
+# Otras Percepciones IVA (QR 3337)
+RX_PERC_IVA_QR3337 = re.compile(r"QR\s*PERCEPCION\s*IVA\s*3337", re.I)  # << NUEVO (grilla)
+
+# Gastos exentos (Cargo Terminal Fiserv)
+RX_GASTO_FISERV = re.compile(r"CARGO\s*TERMINAL\s*FISERV", re.I)         # << NUEVO (grilla)
+
+# Retenciones
+RX_RET_IIBB = re.compile(r"RETENCION(?:ES)?\s+I(?:N)?GRESOS?\s*BR|RETENCION(?:ES)?\s+IBB", re.I)
+RX_RET_IVA  = re.compile(r"RETENCION(?:ES)?\s+IVA\b", re.I)
+RX_RET_GAN  = re.compile(r"RETENCION(?:ES)?\s+GANANCIAS", re.I)
+
+# Bases Netas
+RX_BASE_NETO_21  = re.compile(r"BASE\s*NETO\s*21", re.I)
+RX_BASE_NETO_105 = re.compile(r"BASE\s*NETO\s*10[,\.]?\s*5", re.I)
+
+# =========================
+# Parsing PDF -> Detalle
+# =========================
+LINE_RX = re.compile(rf"^(?P<concepto>.+?)\s+(?P<monto>{AMOUNT_RX})\s*$")
+
+def _pdf_to_lines(pdf_bytes: bytes) -> List[str]:
+    lines: List[str] = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            txt = page.extract_text() or ""
+            for raw in txt.splitlines():
+                line = raw.strip()
+                if line:
+                    lines.append(line)
+    return lines
+
+def _detalle_from_lines(lines: List[str]) -> pd.DataFrame:
+    rows = []
+    for ln in lines:
+        m = LINE_RX.search(ln)
+        if not m:
+            # si el PDF no separa bien, igual capturamos montos al final
+            # heurística: último token con formato importe
+            tokens = ln.split()
+            if not tokens:
+                continue
+            tail = tokens[-1]
+            if re.fullmatch(AMOUNT_RX, tail):
+                concepto = ln[: ln.rfind(tail)].strip(" .-—\t")
+                monto = tail
+            else:
+                continue
+        else:
+            concepto = m.group("concepto").strip(" .-—\t")
+            monto = m.group("monto")
+        rows.append({"Concepto": concepto, "Monto Total": _to_float(monto)})
+    if not rows:
+        return pd.DataFrame(columns=["Concepto", "Monto Total"])
+    df = pd.DataFrame(rows)
+    # Normalizamos espacios múltiples
+    df["Concepto"] = df["Concepto"].str.replace(r"\s+", " ", regex=True)
+    return df
+
+# =========================
+# Resumen / Grilla
+# =========================
+def _calcular_iva21(df: pd.DataFrame) -> float:
+    # Total IVA 21% = genérico + SERV.OPER.INT + SIST CUOTAS (pedido)
+    tot = 0.0
+    tot += _sum(df, RX_IVA21_GENERIC)
+    tot += _sum(df, RX_IVA21_SERV_INT)
+    tot += _sum(df, RX_IVA21_SIST_CUOTAS)  # << incluye SIST CUOTAS
     return tot
 
-# ============ UNIVERSAL (Visa/Master/Maestro, cualquier banco) ============
-# IVA 21%: incluye % explícito, RI S/DTO F.OTORG y RI SERV.OPER. INT.
-RX_IVA21_ANY = re.compile(
-    r"(IVA[^\n]{0,200}?21,00\s*%)[^\n]{0,120}?([\-−]?\s?\d{1,3}(?:\.\d{3})*,\d{2})",
-    re.IGNORECASE
-)
-RX_IVA21_RI_DTO_FOT = re.compile(
-    r"(IVA\s*RI\s*CRED\.?\s*FISC\.?\s*COMERCIO\s*S/DTO\s*F\.?OTORG)[^\d\-−]{0,120}"
-    r"([\-−]?\d{1,3}(?:\.\d{3})*,\d{2})",
-    re.IGNORECASE
-)
-# NUEVO: IVA RI SERV.OPER. INT.  → suma a 21%
-RX_IVA21_RI_SERV_INT = re.compile(
-    r"(IVA\s*RI\s*SERV\.?\s*OPER\.?\s*INT\.?)[^\d\-−]{0,120}"
-    r"([\-−]?\d{1,3}(?:\.\d{3})*,\d{2})",
-    re.IGNORECASE
-)
+def _calcular_iva105(df: pd.DataFrame) -> float:
+    return _sum(df, RX_IVA105_GENERIC)
 
-# IVA 10,5%: Ley 25063 + Costo Financiero 10,50%
-RX_IVA105 = re.compile(
-    r"(IVA\s*CRED\.?\s*FISC\.?\s*COM\.?\s*L\.?\s*25063\s*S/DTO\s*F\.?OTOR\s*10,50%|"
-    r"IVA\s*S/COSTO\s*FINANCIERO\s*10,50%)"
-    r"[^\d\-−]*(\-?\d{1,3}(?:\.\d{3})*,\d{2})",
-    re.IGNORECASE
-)
+def _calcular_base_neto(df: pd.DataFrame, tasa: float, iva_total: float) -> float:
+    # Si ya viene impreso "Base Neto XX" en el resumen bancario, lo priorizamos.
+    rx = RX_BASE_NETO_21 if tasa == 0.21 else RX_BASE_NETO_105
+    impreso = _sum(df, rx)
+    if abs(impreso) > 0:
+        return impreso
+    # Si no está impreso, lo estimamos a partir del IVA detectado.
+    if tasa > 0:
+        return iva_total / tasa
+    return 0.0
 
-# Percepciones IVA RG 2408
-RX_PERC_IVA_30 = re.compile(
-    r"PERCEPCI[ÓO]N\s*IVA\s*(?:R\.?\s*G\.?|RG)\s*2408\s*3,00\s*%[^\d\-−]*(\-?\d{1,3}(?:\.\d{3})*,\d{2})",
-    re.IGNORECASE
-)
-RX_PERC_IVA_15 = re.compile(
-    r"PERCEPCI[ÓO]N\s*IVA\s*(?:R\.?\s*G\.?|RG)\s*2408\s*1,50\s*%[^\d\-−]*(\-?\d{1,3}(?:\.\d{3})*,\d{2})",
-    re.IGNORECASE
-)
+def construir_resumen(detalle: pd.DataFrame) -> pd.DataFrame:
+    iva21 = _calcular_iva21(detalle)
+    iva105 = _calcular_iva105(detalle)
 
-# Retenciones universales
-RX_RET_IIBB = re.compile(r"RETENCION\s*ING\.?\s*BRUTOS[^\d\-−]*(\-?\d{1,3}(?:\.\d{3})*,\d{2})", re.IGNORECASE)
-RX_RET_IVA  = re.compile(r"RETENCI[ÓO]N\s*IVA[^\d\-−]*(\-?\d{1,3}(?:\.\d{3})*,\d{2})", re.IGNORECASE)
-RX_RET_GCIAS= re.compile(r"RETENCI[ÓO]N\s*(IMP\.?\s*GANANCIAS|GANANCIAS)[^\d\-−]*(\-?\d{1,3}(?:\.\d{3})*,\d{2})", re.IGNORECASE)
+    base21 = _calcular_base_neto(detalle, 0.21, iva21)
+    base105 = _calcular_base_neto(detalle, 0.105, iva105)
 
-def extract_universal(text: str) -> dict:
-    tot = {"iva21": 0.0, "iva105": 0.0, "perc_30": 0.0, "perc_15": 0.0, "ret_iibb": 0.0, "ret_iva": 0.0, "ret_gcias": 0.0}
-    for m in RX_IVA21_ANY.finditer(text):         tot["iva21"] += to_float_signed(m.group(2))
-    for m in RX_IVA21_RI_DTO_FOT.finditer(text):  tot["iva21"] += to_float_signed(m.group(2))
-    for m in RX_IVA21_RI_SERV_INT.finditer(text): tot["iva21"] += to_float_signed(m.group(2))  # ← NUEVO
-    for m in RX_IVA105.finditer(text):            tot["iva105"] += to_float_signed(m.group(2))
-    for m in RX_PERC_IVA_30.finditer(text):       tot["perc_30"] += to_float_signed(m.group(1))
-    for m in RX_PERC_IVA_15.finditer(text):       tot["perc_15"] += to_float_signed(m.group(1))
-    for m in RX_RET_IIBB.finditer(text):          tot["ret_iibb"] += to_float_signed(m.group(1))
-    for m in RX_RET_IVA.finditer(text):           tot["ret_iva"]  += to_float_signed(m.group(1))
-    for m in RX_RET_GCIAS.finditer(text):         tot["ret_gcias"]+= to_float_signed(m.group(2))
-    return {k: round(v, 2) for k, v in tot.items()}
+    perc_iva_total = _sum(detalle, RX_PERC_IVA_RG2408)
+    otras_perc_iva = _sum(detalle, RX_PERC_IVA_QR3337)  # << NUEVO
+    gastos_exentos = _sum(detalle, RX_GASTO_FISERV)     # << NUEVO
 
-# ============ Router + Consolidación ============
-def extract_resumen_from_bytes(pdf_bytes: bytes) -> pd.DataFrame:
-    tmp_path = "_aie_input.pdf"
-    with open(tmp_path, "wb") as f: f.write(pdf_bytes)
+    ret_iibb = _sum(detalle, RX_RET_IIBB)
+    ret_iva  = _sum(detalle, RX_RET_IVA)
+    ret_gan  = _sum(detalle, RX_RET_GAN)
 
-    cabal_tot = {"iva_arancel": 0.0, "iva_costo": 0.0, "percep_rg333": 0.0, "ret_iibb": 0.0, "menos_iva": 0.0}
-    uni_tot   = {"iva21": 0.0, "iva105": 0.0, "perc_30": 0.0, "perc_15": 0.0, "ret_iibb": 0.0, "ret_iva": 0.0, "ret_gcias": 0.0}
-    saw_cabal = False
-
-    with pdfplumber.open(tmp_path) as pdf:
-        for page in pdf.pages:
-            text = (page.extract_text() or "").replace("\xa0", " ").replace("−", "-")
-            page_cabal = extract_cabal_exact(text)
-            if any(v != 0.0 for v in page_cabal.values()):
-                saw_cabal = True
-                for k in cabal_tot: cabal_tot[k] += page_cabal[k]
-            else:
-                page_uni = extract_universal(text)
-                for k in uni_tot:   uni_tot[k] += page_uni[k]
-
-    if saw_cabal:
-        iva21   = round(cabal_tot["iva_arancel"], 2)     # replica tu Cabal “bien”
-        base21  = round(iva21 / 0.21, 2) if iva21 else 0.0
-        iva105  = round(cabal_tot["iva_costo"], 2)
-        base105 = round(iva105 / 0.105, 2) if iva105 else 0.0
-        percep  = round(cabal_tot["percep_rg333"], 2)
-        ret_iibb= round(cabal_tot["ret_iibb"], 2)
-        ret_iva = 0.0
-        ret_gcs = 0.0
-    else:
-        iva21   = round(uni_tot["iva21"], 2)
-        base21  = round(iva21 / 0.21, 2) if iva21 else 0.0
-        iva105  = round(uni_tot["iva105"], 2)
-        base105 = round(iva105 / 0.105, 2) if iva105 else 0.0
-        percep  = round(uni_tot["perc_30"] + uni_tot["perc_15"], 2)
-        ret_iibb= round(uni_tot["ret_iibb"], 2)
-        ret_iva = round(uni_tot["ret_iva"], 2)
-        ret_gcs = round(uni_tot["ret_gcias"], 2)
-
-    resumen = pd.DataFrame({
-        "Concepto": [
-            "Base Neto 21%", "IVA 21% (Total)",
-            "Base Neto 10,5%", "IVA 10,5% (Total)",
-            "Percepciones IVA (Total)",
-            "Retenciones IBB", "Retenciones IVA", "Retenciones Ganancias",
-        ],
-        "Monto Total": [base21, iva21, base105, iva105, percep, ret_iibb, ret_iva, ret_gcs],
-    })
+    filas = [
+        {"Concepto": "Base Neto 21%",          "Monto Total": base21},
+        {"Concepto": "IVA 21% (Total)",        "Monto Total": iva21},  # incluye SIST CUOTAS + SERV.OPER.INT
+        {"Concepto": "Base Neto 10,5%",        "Monto Total": base105},
+        {"Concepto": "IVA 10,5% (Total)",      "Monto Total": iva105},
+        {"Concepto": "Percepciones IVA (Total)","Monto Total": perc_iva_total},
+        {"Concepto": "Otras per. de IVA",      "Monto Total": otras_perc_iva},  # << NUEVO
+        {"Concepto": "Gastos Exentos",         "Monto Total": gastos_exentos},  # << NUEVO
+        {"Concepto": "Retenciones IBB",        "Monto Total": ret_iibb},
+        {"Concepto": "Retenciones IVA",        "Monto Total": ret_iva},
+        {"Concepto": "Retenciones Ganancias",  "Monto Total": ret_gan},
+    ]
+    resumen = pd.DataFrame(filas)
     return resumen
 
-# ============ PDF builder (SIN footer) ============
-def build_report_pdf(resumen_df: pd.DataFrame, out_path: str, titulo: str, agregar_total_general: bool = True):
-    styles = getSampleStyleSheet()
-    title_style = styles["Title"]; normal = styles["Normal"]; h2 = styles["Heading2"]
+# API principal usada por app.py
+def procesar_pdfs(file_bytes_list: List[bytes]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Retorna (resumen, detalle)
+    - detalle: concatenación de todos los detalles de cada PDF
+    - resumen: grilla con totales solicitados
+    """
+    detalles = []
+    for fb in file_bytes_list:
+        lines = _pdf_to_lines(fb)
+        det = _detalle_from_lines(lines)
+        if not det.empty:
+            detalles.append(det)
 
-    doc = SimpleDocTemplate(out_path, pagesize=A4)
-    story = []
+    if detalles:
+        detalle_all = pd.concat(detalles, ignore_index=True)
+    else:
+        detalle_all = pd.DataFrame(columns=["Concepto", "Monto Total"])
 
-    story.append(Paragraph(titulo, title_style))
-    story.append(Paragraph(f"Generado: {datetime.datetime.now().strftime('%d/%m/%Y %H:%M')}", normal))
-    story.append(Spacer(1, 12))
-    story.append(Paragraph("Resumen de importes", h2))
-
-    data = [["Concepto", "Monto ($)"]]
-    total_general = 0.0
-    for _, row in resumen_df.iterrows():
-        val = float(row["Monto Total"])
-        total_general += val
-        data.append([row["Concepto"], format_money(val)])
-
-    if agregar_total_general:
-        data.append(["TOTAL GENERAL", format_money(total_general)])
-
-    tbl = Table(data, colWidths=[360, 140])
-    tbl.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#222")),
-        ("TEXTCOLOR", (0,0), (-1,0), colors.whitesmoke),
-        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-        ("ALIGN", (1,1), (-1,-1), "RIGHT"),
-        ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
-        ("ROWBACKGROUNDS", (0,1), (-1,-2), [colors.HexColor("#f7f7f7"), colors.white]),
-        ("BACKGROUND", (0,-1), (-1,-1), colors.HexColor("#e6f2ff")),
-        ("FONTNAME", (0,-1), (-1,-1), "Helvetica-Bold"),
-    ]))
-    story.append(tbl)
-
-    doc.build(story)
-    return out_path
+    resumen = construir_resumen(detalle_all)
+    return resumen, detalle_all
 
