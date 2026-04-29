@@ -12,6 +12,7 @@ from backend import (
     build_report_pdf,
     format_money,
     HOLISTOR_COLUMNS,
+    BANK_MASTER,
 )
 
 APP_TITLE = "IA AIE - Control tarjetas crédito/débito"
@@ -46,6 +47,39 @@ with col1:
     gen_pdf = st.checkbox("Generar informe PDF", value=True)
 with col2:
     show_table = st.checkbox("Mostrar tablas en pantalla", value=True)
+
+BANK_FALLBACK_LABELS = {
+    "Nuevo Banco de Santa Fe": "NBSF",
+    "Banco Macro": "MACRO",
+    "Banco Nación": "BNA",
+    "Banco Credicoop": "CREDICOOP",
+}
+
+st.markdown("### Banco emisor")
+banco_fallback_label = st.selectbox(
+    "Si el banco no se detecta automáticamente, usar:",
+    options=list(BANK_FALLBACK_LABELS.keys()),
+    index=0,
+)
+forzar_banco = st.checkbox(
+    "Forzar este banco para todos los archivos",
+    value=False,
+    help="Activar solo si todos los PDFs pertenecen al mismo banco y la detección automática no corresponde.",
+)
+
+
+def aplicar_banco_manual_si_corresponde(meta: dict, banco_key: str, forzar: bool = False) -> dict:
+    meta = dict(meta or {})
+    if forzar or meta.get("key") == "NO_DETECTADO":
+        bank_data = BANK_MASTER.get(banco_key, BANK_MASTER["NO_DETECTADO"]).copy()
+        for k, v in bank_data.items():
+            meta[k] = v
+        meta["key"] = banco_key
+        meta["banco"] = meta.get("razon_social", "")
+        meta["banco_asignado_manual"] = True
+    else:
+        meta["banco_asignado_manual"] = False
+    return meta
 
 
 def limpiar_vista_resumen(df: pd.DataFrame) -> pd.DataFrame:
@@ -111,6 +145,11 @@ if st.button("Procesar y generar archivos"):
 
             try:
                 meta = extract_file_metadata(file_bytes, filename=pdf_file.name)
+                meta = aplicar_banco_manual_si_corresponde(
+                    meta,
+                    BANK_FALLBACK_LABELS[banco_fallback_label],
+                    forzar=forzar_banco,
+                )
                 resumen = extract_resumen_from_bytes(file_bytes)
 
                 if resumen is None or resumen.empty:
@@ -141,6 +180,7 @@ if st.button("Procesar y generar archivos"):
                         "Periodo": meta.get("periodo_label", ""),
                         "Suc.": meta.get("suc", ""),
                         "Número": str(secuencia).zfill(8),
+                        "Asignado manual": "Sí" if meta.get("banco_asignado_manual") else "No",
                     }
                 )
 
