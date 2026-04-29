@@ -454,6 +454,54 @@ def extract_tax_lines(text: str) -> dict:
                 add("base21_direct", vals[0], up, dedupe_amount=False)
             continue
 
+    # Resúmenes mensuales Visa/Credicoop: el resumen trae el bloque exacto
+    # "Base Imponible IVA / Monto Gravado". En ese caso NO conviene sumar
+    # solo ARANCEL diario, porque el neto 21 también incluye Servicio Payway / Cobro Anticipado.
+    full_text = (text or "").replace("\xa0", " ").replace("−", "-")
+    full_up = re.sub(r"\s+", " ", full_text.upper())
+
+    base21_overrides = []
+    base105_overrides = []
+
+    # Formato en líneas separadas:
+    # Base Imponible IVA Monto Gravado
+    # Tasa 21,00 % $ 11.153,44
+    # Tasa 10,50 % $ 20.937,28
+    for m in re.finditer(
+        r"TASA\s+21[,\.]00\s*%\s*\$?\s*(\d{1,3}(?:\.\d{3})*,\d{2})",
+        full_text,
+        flags=re.IGNORECASE,
+    ):
+        # Solo usarlo como override si el documento efectivamente contiene el bloque de base imponible.
+        if "BASE IMPONIBLE IVA" in full_up or "MONTO GRAVADO" in full_up:
+            base21_overrides.append(abs(to_float_signed(m.group(1))))
+
+    for m in re.finditer(
+        r"TASA\s+10[,\.]50\s*%\s*\$?\s*(\d{1,3}(?:\.\d{3})*,\d{2})",
+        full_text,
+        flags=re.IGNORECASE,
+    ):
+        if "BASE IMPONIBLE IVA" in full_up or "MONTO GRAVADO" in full_up:
+            base105_overrides.append(abs(to_float_signed(m.group(1))))
+
+    if base21_overrides:
+        tot["base21_direct"] = round2(sum(base21_overrides))
+    if base105_overrides:
+        tot["base105_direct"] = round2(sum(base105_overrides))
+
+    # En algunos resúmenes mensuales aparece como "Percep./Retenc.AFIP-DGI" sin especificar IVA.
+    # Se lo envía a Percepción IVA para no perder el importe fiscal.
+    if round2(tot.get("perc_iva", 0.0)) == 0:
+        perc_afip = 0.0
+        for m in re.finditer(
+            r"PERCEP\.?\s*/\s*RETENC\.?\s*AFIP\s*-?\s*DGI\s*\$?\s*(\d{1,3}(?:\.\d{3})*,\d{2})",
+            full_text,
+            flags=re.IGNORECASE,
+        ):
+            perc_afip += abs(to_float_signed(m.group(1)))
+        if perc_afip:
+            tot["perc_iva"] = round2(perc_afip)
+
     return {k: round2(v) for k, v in tot.items()}
 
 # ============ Compatibilidad con backend anterior ============
