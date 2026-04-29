@@ -13,6 +13,7 @@ from backend import (
     format_money,
     HOLISTOR_COLUMNS,
     BANK_MASTER,
+    build_resumen_operativo_agrupado,
 )
 
 APP_TITLE = "IA AIE - Control tarjetas crédito/débito"
@@ -99,10 +100,37 @@ def limpiar_vista_resumen(df: pd.DataFrame) -> pd.DataFrame:
 
 def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
     output = io.BytesIO()
+
+    numeric_columns = {
+        "Monto Total",
+        "Neto Gravado",
+        "IVA Liquidado",
+        "IVA Crédito",
+        "Conceptos NG/EX",
+        "Perc./Ret.",
+        "Total",
+    }
+
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name=sheet_name)
         ws = writer.book[sheet_name]
         ws.freeze_panes = "A2"
+
+        header_to_col = {cell.value: cell.column for cell in ws[1]}
+        for header in numeric_columns:
+            col_idx = header_to_col.get(header)
+            if not col_idx:
+                continue
+            for row_idx in range(2, ws.max_row + 1):
+                cell = ws.cell(row=row_idx, column=col_idx)
+                if cell.value in (None, ""):
+                    continue
+                try:
+                    cell.value = float(cell.value)
+                    cell.number_format = "#,##0.00"
+                except (TypeError, ValueError):
+                    pass
+
         for col in ws.columns:
             max_length = 0
             col_letter = col[0].column_letter
@@ -110,6 +138,7 @@ def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str) -> bytes:
                 value = "" if cell.value is None else str(cell.value)
                 max_length = max(max_length, len(value))
             ws.column_dimensions[col_letter].width = min(max_length + 2, 42)
+
     output.seek(0)
     return output.getvalue()
 
@@ -159,9 +188,10 @@ if st.button("Procesar y generar archivos"):
                 resumen = resumen.copy()
                 resumen.insert(0, "Archivo", pdf_file.name)
                 resumen.insert(1, "Banco", meta.get("razon_social", ""))
-                resumen.insert(2, "Periodo", meta.get("periodo_label", ""))
-                resumen.insert(3, "Suc.", meta.get("suc", ""))
-                resumen.insert(4, "Número", str(secuencia).zfill(8))
+                resumen.insert(2, "Fecha", meta.get("fecha_emision", ""))
+                resumen.insert(3, "Periodo", meta.get("periodo_label", ""))
+                resumen.insert(4, "Suc.", meta.get("suc", ""))
+                resumen.insert(5, "Número", str(secuencia).zfill(8))
                 resumenes.append(resumen)
 
                 compras = build_holistor_compras_from_resumen(
@@ -177,6 +207,7 @@ if st.button("Procesar y generar archivos"):
                         "Archivo": pdf_file.name,
                         "Banco": meta.get("razon_social", ""),
                         "CUIT": meta.get("cuit", ""),
+                        "Fecha": meta.get("fecha_emision", ""),
                         "Periodo": meta.get("periodo_label", ""),
                         "Suc.": meta.get("suc", ""),
                         "Número": str(secuencia).zfill(8),
@@ -197,6 +228,7 @@ if st.button("Procesar y generar archivos"):
 
     resumen_total = pd.concat(resumenes, ignore_index=True)
     resumen_vista = limpiar_vista_resumen(resumen_total)
+    resumen_agrupado = build_resumen_operativo_agrupado(resumen_vista)
 
     if compras_holistor:
         compras_total = pd.concat(compras_holistor, ignore_index=True)
@@ -205,38 +237,48 @@ if st.button("Procesar y generar archivos"):
         compras_total = pd.DataFrame(columns=HOLISTOR_COLUMNS)
 
     if show_table:
-        tab1, tab2, tab3 = st.tabs(["Resumen operativo", "Compras Holistor", "Archivos"])
+        tab1, tab2, tab3, tab4 = st.tabs(["Resumen operativo", "Detalle operativo", "Compras Holistor", "Archivos"])
 
         with tab1:
             st.subheader("Resumen operativo consolidado")
-            df_display = resumen_vista.copy()
+            st.caption("Vista agrupada para control rápido. El Excel operativo conserva todos los movimientos.")
+            df_display = resumen_agrupado.copy()
             if "Monto Total" in df_display.columns:
                 df_display["Monto Total"] = df_display["Monto Total"].apply(format_money)
             st.dataframe(df_display, use_container_width=True)
 
         with tab2:
+            st.subheader("Detalle operativo")
+            df_detalle = resumen_vista.copy()
+            if "Monto Total" in df_detalle.columns:
+                df_detalle["Monto Total"] = df_detalle["Monto Total"].apply(format_money)
+            st.dataframe(df_detalle, use_container_width=True)
+
+        with tab3:
             st.subheader("Excel de compras para importar en Holistor")
             st.dataframe(compras_total, use_container_width=True)
 
-        with tab3:
+        with tab4:
             st.subheader("Archivos procesados")
             st.dataframe(pd.DataFrame(procesados), use_container_width=True)
             if errores:
                 st.warning("Algunos archivos tuvieron errores.")
                 st.dataframe(pd.DataFrame(errores), use_container_width=True)
 
-    resumen_excel_bytes = df_to_excel_bytes(resumen_vista, sheet_name="Resumen operativo")
+    resumen_excel_bytes = df_to_excel_bytes(resumen_vista, sheet_name="Detalle operativo")
+    resumen_agrupado_excel_bytes = df_to_excel_bytes(resumen_agrupado, sheet_name="Resumen agrupado")
     compras_excel_bytes = df_to_excel_bytes(compras_total, sheet_name="HWCompra-modelo")
 
     download_files = {
-        "resumen_operativo.xlsx": resumen_excel_bytes,
+        "resumen_operativo_detalle.xlsx": resumen_excel_bytes,
+        "resumen_operativo_agrupado.xlsx": resumen_agrupado_excel_bytes,
         "compras_holistor.xlsx": compras_excel_bytes,
     }
 
     if gen_pdf:
         out_path = "IA_sumatoria_tarjetas.pdf"
         build_report_pdf(
-            resumen_vista,
+            resumen_agrupado,
             out_path,
             titulo="IA AIE - Control tarjetas crédito/débito",
             agregar_total_general=True,
@@ -252,9 +294,16 @@ if st.button("Procesar y generar archivos"):
         )
 
     st.download_button(
-        "⬇️ Descargar resumen operativo Excel",
+        "⬇️ Descargar resumen operativo Excel (detalle completo)",
         resumen_excel_bytes,
-        file_name="resumen_operativo.xlsx",
+        file_name="resumen_operativo_detalle.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    st.download_button(
+        "⬇️ Descargar resumen operativo agrupado Excel",
+        resumen_agrupado_excel_bytes,
+        file_name="resumen_operativo_agrupado.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
