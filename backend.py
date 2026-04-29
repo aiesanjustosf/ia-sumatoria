@@ -143,60 +143,109 @@ def detect_bank_from_bytes(pdf_bytes: bytes, filename: str = "") -> dict:
     return data
 
 
+MONTHS_ES = {
+    "ENERO": 1, "FEBRERO": 2, "MARZO": 3, "ABRIL": 4, "MAYO": 5, "JUNIO": 6,
+    "JULIO": 7, "AGOSTO": 8, "SEPTIEMBRE": 9, "SETIEMBRE": 9, "OCTUBRE": 10,
+    "NOVIEMBRE": 11, "DICIEMBRE": 12,
+}
+
+
+def _parse_date_any(s: str):
+    s = (s or "").strip()
+    for fmt in ("%d/%m/%Y", "%d/%m/%y", "%d-%m-%Y", "%d-%m-%y"):
+        try:
+            d = datetime.datetime.strptime(s, fmt).date()
+            if 2000 <= d.year <= 2099:
+                return d
+        except ValueError:
+            pass
+    return None
+
+
+def _date_payload(d: datetime.date, periodo_label: str = "", fecha_texto: str = "") -> dict:
+    return {
+        "fecha_emision": d.strftime("%d/%m/%Y"),
+        "suc": d.strftime("%m%y"),
+        "periodo_label": periodo_label or d.strftime("%m/%Y"),
+        "fecha_detectada_texto": fecha_texto,
+    }
+
+
 def extract_period_from_text(text: str) -> dict:
     """
-    Usa como fecha del comprobante la última fecha válida que aparece en el resumen.
-    Además arma Suc. como MMYY desde esa misma fecha.
+    Fecha del comprobante: fecha de cierre / fin de período del resumen.
+    No toma simplemente la última fecha del PDF, porque algunos resúmenes traen
+    fechas sueltas de comprobantes/vencimientos que pueden pertenecer a otro período.
+    Si no encuentra período explícito, usa el mes/año más frecuente del resumen y
+    toma la última fecha dentro de ese mes.
     """
     raw = text or ""
     clean = re.sub(r"\s+", " ", raw).upper()
 
-    def parse_date(s):
-        for fmt in ("%d/%m/%Y", "%d/%m/%y"):
-            try:
-                d = datetime.datetime.strptime(s, fmt).date()
-                if 2000 <= d.year <= 2099:
-                    return d
-            except ValueError:
-                pass
-        return None
+    period_patterns = [
+        r"PER[IÍ]ODO\s*(?:DESDE|DEL)?\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:AL|A|HASTA|-)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+        r"(?:DESDE|DEL)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:AL|A|HASTA|-)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+        r"FECHA\s*(?:DE)?\s*(?:CIERRE|HASTA|FINAL|FIN)\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+        r"(?:CIERRE|HASTA)\s*(?:DEL\s*)?(?:RESUMEN|PER[IÍ]ODO|LOTE)?\s*[:\-]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+    ]
+    for pat in period_patterns:
+        m = re.search(pat, clean, flags=re.IGNORECASE)
+        if not m:
+            continue
+        end_txt = m.group(m.lastindex)
+        end_date = _parse_date_any(end_txt)
+        if end_date:
+            if m.lastindex and m.lastindex >= 2:
+                periodo_label = f"{m.group(1)} al {m.group(2)}"
+            else:
+                periodo_label = end_date.strftime("%m/%Y")
+            return _date_payload(end_date, periodo_label=periodo_label, fecha_texto=end_txt)
 
-    date_matches = list(re.finditer(r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b", clean))
+    m = re.search(r"(?:PER[IÍ]ODO|RESUMEN|LIQUIDACI[ÓO]N)\s*[:\-]?\s*(ENERO|FEBRERO|MARZO|ABRIL|MAYO|JUNIO|JULIO|AGOSTO|SEPTIEMBRE|SETIEMBRE|OCTUBRE|NOVIEMBRE|DICIEMBRE)\s+(20\d{2})", clean)
+    if m:
+        month = MONTHS_ES[m.group(1)]
+        year = int(m.group(2))
+        next_month = datetime.date(year + (month == 12), 1 if month == 12 else month + 1, 1)
+        end_date = next_month - datetime.timedelta(days=1)
+        return _date_payload(end_date, periodo_label=f"{month:02d}/{year}", fecha_texto=m.group(0))
+
+    m = re.search(r"(?:PER[IÍ]ODO|RESUMEN|LIQUIDACI[ÓO]N)\s*[:\-]?\s*(\d{1,2})[/-](20\d{2}|\d{2})", clean)
+    if m:
+        month = int(m.group(1))
+        year = int(m.group(2))
+        if year < 100:
+            year += 2000
+        if 1 <= month <= 12:
+            next_month = datetime.date(year + (month == 12), 1 if month == 12 else month + 1, 1)
+            end_date = next_month - datetime.timedelta(days=1)
+            return _date_payload(end_date, periodo_label=f"{month:02d}/{year}", fecha_texto=m.group(0))
+
+    date_matches = list(re.finditer(r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b", clean))
     fechas_validas = []
     for m in date_matches:
-        d = parse_date(m.group(1))
-        if d:
-            fechas_validas.append((m.start(), m.group(1), d))
+        d = _parse_date_any(m.group(1))
+        if not d:
+            continue
+        ctx = clean[max(0, m.start() - 40): m.end() + 40]
+        is_due = bool(re.search(r"VENC|PAGO\s+MINIMO|PAGO\s+M[IÍ]NIMO", ctx))
+        fechas_validas.append({"pos": m.start(), "txt": m.group(1), "date": d, "due": is_due})
 
-    if fechas_validas:
-        _, fecha_texto, date_ref = fechas_validas[-1]
-        periodo_label = date_ref.strftime("%m/%Y")
+    operativas = [x for x in fechas_validas if not x["due"]]
+    base = operativas if operativas else fechas_validas
 
-        period_patterns = [
-            r"PER[IÍ]ODO\s*(?:DESDE)?\s*(\d{1,2}/\d{1,2}/\d{2,4})\s*(?:AL|A|HASTA|-)\s*(\d{1,2}/\d{1,2}/\d{2,4})",
-            r"PER[IÍ]ODO\s*[:\-]?\s*(\d{1,2}/\d{1,2}/\d{2,4})\s*(?:AL|A|HASTA|-)\s*(\d{1,2}/\d{1,2}/\d{2,4})",
-            r"DESDE\s*(\d{1,2}/\d{1,2}/\d{2,4})\s*(?:AL|A|HASTA)\s*(\d{1,2}/\d{1,2}/\d{2,4})",
-        ]
-        for pat in period_patterns:
-            m = re.search(pat, clean, flags=re.IGNORECASE)
-            if m:
-                periodo_label = f"{m.group(1)} al {m.group(2)}"
-                break
-
-        return {
-            "fecha_emision": date_ref.strftime("%d/%m/%Y"),
-            "suc": date_ref.strftime("%m%y"),
-            "periodo_label": periodo_label,
-            "fecha_detectada_texto": fecha_texto,
-        }
+    if base:
+        counts = {}
+        for item in base:
+            key = (item["date"].year, item["date"].month)
+            counts[key] = counts.get(key, 0) + 1
+        modal_key = sorted(counts.items(), key=lambda kv: (kv[1], kv[0][0], kv[0][1]), reverse=True)[0][0]
+        candidates = [x for x in base if (x["date"].year, x["date"].month) == modal_key]
+        chosen = sorted(candidates, key=lambda x: (x["date"], x["pos"]))[-1]
+        return _date_payload(chosen["date"], periodo_label=f"{modal_key[1]:02d}/{modal_key[0]}", fecha_texto=chosen["txt"])
 
     today = datetime.date.today()
-    return {
-        "fecha_emision": today.strftime("%d/%m/%Y"),
-        "suc": today.strftime("%m%y"),
-        "periodo_label": today.strftime("%m/%Y"),
-        "fecha_detectada_texto": "",
-    }
+    return _date_payload(today, periodo_label=today.strftime("%m/%Y"), fecha_texto="")
+
 
 def extract_file_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
     text = read_pdf_text_from_bytes(pdf_bytes)
@@ -206,6 +255,35 @@ def extract_file_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
 
 
 # ============ CABAL ============
+
+AMOUNT_RE = re.compile(r"[-−]?\s*\d+(?:\.\d{3})*,\d{2}")
+
+
+def _line_amounts(line: str) -> list[float]:
+    """
+    Toma importes monetarios de una línea. Antes elimina porcentajes para no
+    confundir 21,00% / 10,50% con montos.
+    """
+    clean_line = re.sub(r"\d+(?:[.,]\d+)?\s*%", " ", line or "")
+    vals = []
+    for m in AMOUNT_RE.finditer(clean_line):
+        try:
+            vals.append(abs(to_float_signed(m.group(0))))
+        except Exception:
+            pass
+    return vals
+
+
+def _last_amount(line: str) -> float:
+    vals = _line_amounts(line)
+    return vals[-1] if vals else 0.0
+
+
+def _is_credit_or_reversal(line: str) -> bool:
+    up = (line or "").upper()
+    return bool(re.search(r"DEVOL|REINTEG|REVERS|ANUL|EXTORNO|CREDITO|CR[ÉE]DITO", up))
+
+
 CABAL_PATTERNS = {
     "IVA_ARANCEL_21": re.compile(r"IVA S/ARANCEL DE DESCUENTO\s+21,00%.*?([\d.]+,\d{2})\s*[-−]", re.IGNORECASE),
     "IVA_COSTO_10_5": re.compile(r"IVA S/COSTO FINANCIERO\s+10,50%.*?([\d.]+,\d{2})\s*[-−]", re.IGNORECASE),
@@ -216,20 +294,49 @@ CABAL_PATTERNS = {
 
 
 def extract_cabal_exact(text: str) -> dict:
+    """
+    Cabal robusto por línea. El backend anterior dependía de regex con puntos de
+    miles y signo final; si el PDF cambiaba mínimamente el formato, perdía importes.
+    """
     tot = {"iva_arancel": 0.0, "iva_costo": 0.0, "percep_rg333": 0.0, "ret_iibb": 0.0, "menos_iva": 0.0}
+
+    for raw_line in (text or "").splitlines():
+        line = raw_line.replace("\xa0", " ").replace("−", "-")
+        up = line.upper()
+        amount = _last_amount(line)
+        if not amount:
+            continue
+
+        if "IVA S/ARANCEL DE DESCUENTO" in up and re.search(r"21[,\.]00\s*%", up):
+            tot["iva_arancel"] += amount
+        elif "IVA S/COSTO FINANCIERO" in up and re.search(r"10[,\.]50\s*%", up):
+            tot["iva_costo"] += amount
+        elif re.search(r"PERCEPCI[ÓO]N\s*(DE\s*)?IVA", up) and re.search(r"(RG|R\.G\.?)\s*333|3337|2408", up):
+            tot["percep_rg333"] += amount
+        elif re.search(r"RETENCI[ÓO]N", up) and re.search(r"INGRESOS\s*BR|ING\.?\s*BR|IIBB", up):
+            tot["ret_iibb"] += amount
+        elif re.search(r"^\s*[-]?\s*IVA\s+21[,\.]00\s*%", up):
+            tot["menos_iva"] += amount
+
+    # Fallback de seguridad: conserva los patrones validados si aparecieran líneas no capturadas.
+    regex_tot = {"iva_arancel": 0.0, "iva_costo": 0.0, "percep_rg333": 0.0, "ret_iibb": 0.0, "menos_iva": 0.0}
     for key, rx in CABAL_PATTERNS.items():
-        for m in rx.finditer(text):
+        for m in rx.finditer(text or ""):
             val = abs(to_float_signed(m.group(1)))
             if key == "IVA_ARANCEL_21":
-                tot["iva_arancel"] += val
+                regex_tot["iva_arancel"] += val
             elif key == "IVA_COSTO_10_5":
-                tot["iva_costo"] += val
+                regex_tot["iva_costo"] += val
             elif key == "PERCEPCION_RG333":
-                tot["percep_rg333"] += val
+                regex_tot["percep_rg333"] += val
             elif key == "RETENCION_IB":
-                tot["ret_iibb"] += val
+                regex_tot["ret_iibb"] += val
             elif key == "MENOS_IVA_21":
-                tot["menos_iva"] += val
+                regex_tot["menos_iva"] += val
+
+    # Usa el mayor por rubro para no duplicar cuando ambos métodos capturan la misma línea.
+    for k in tot:
+        tot[k] = max(round2(tot[k]), round2(regex_tot[k]))
     return tot
 
 
@@ -287,6 +394,11 @@ RX_PERC_IIBB = re.compile(
 
 
 def extract_universal(text: str) -> dict:
+    """
+    Extractor universal robusto por línea.
+    Evita perder montos cuando el PDF no usa separador de miles o mueve el signo.
+    Clasifica por concepto y toma el último importe monetario de cada línea.
+    """
     tot = {
         "iva21": 0.0,
         "iva105": 0.0,
@@ -299,32 +411,54 @@ def extract_universal(text: str) -> dict:
         "ret_iva": 0.0,
         "ret_gcias": 0.0,
     }
-    for m in RX_IVA21_ANY.finditer(text):
-        tot["iva21"] += abs(to_float_signed(m.group(2)))
-    for m in RX_IVA21_RI_DTO_FOT.finditer(text):
-        tot["iva21"] += abs(to_float_signed(m.group(2)))
-    for m in RX_IVA21_RI_SERV_INT.finditer(text):
-        tot["iva21"] += abs(to_float_signed(m.group(2)))
-    for m in RX_IVA21_RI_SIST_CUOTAS.finditer(text):
-        tot["iva21"] += abs(to_float_signed(m.group(2)))
-    for m in RX_IVA105.finditer(text):
-        tot["iva105"] += abs(to_float_signed(m.group(2)))
-    for m in RX_PERC_IVA_30.finditer(text):
-        tot["perc_30"] += abs(to_float_signed(m.group(1)))
-    for m in RX_PERC_IVA_15.finditer(text):
-        tot["perc_15"] += abs(to_float_signed(m.group(1)))
-    for m in RX_PERC_IVA_QR3337.finditer(text):
-        tot["perc_qr3337"] += abs(to_float_signed(m.group(1)))
-    for m in RX_PERC_IIBB.finditer(text):
-        tot["perc_iibb"] += abs(to_float_signed(m.group(1)))
-    for m in RX_GASTO_TERMINAL_FISERV.finditer(text):
-        tot["gasto_fiserv"] += abs(to_float_signed(m.group(1)))
-    for m in RX_RET_IIBB.finditer(text):
-        tot["ret_iibb"] += abs(to_float_signed(m.group(1)))
-    for m in RX_RET_IVA.finditer(text):
-        tot["ret_iva"] += abs(to_float_signed(m.group(1)))
-    for m in RX_RET_GCIAS.finditer(text):
-        tot["ret_gcias"] += abs(to_float_signed(m.group(2)))
+
+    for raw_line in (text or "").splitlines():
+        line = raw_line.replace("\xa0", " ").replace("−", "-")
+        up = line.upper()
+        amount = _last_amount(line)
+        if not amount:
+            continue
+
+        is_perc = bool(re.search(r"PERCEPCI[ÓO]N|PERCEP\.?", up))
+        is_ret = bool(re.search(r"RETENCI[ÓO]N|RET\.?", up))
+        is_iibb = bool(re.search(r"INGRESOS\s*BRUTOS|ING\.?\s*BR|IIBB|IBB", up))
+        is_iva = "IVA" in up
+
+        if is_ret and is_iibb:
+            tot["ret_iibb"] += amount
+            continue
+        if is_ret and is_iva:
+            tot["ret_iva"] += amount
+            continue
+        if is_ret and re.search(r"GANANCIAS|IMP\.?\s*GAN", up):
+            tot["ret_gcias"] += amount
+            continue
+        if is_perc and is_iibb:
+            tot["perc_iibb"] += amount
+            continue
+        if is_perc and is_iva:
+            # Se mantiene todo dentro de Percepción IVA para exportar P007.
+            if re.search(r"1[,\.]50\s*%", up):
+                tot["perc_15"] += amount
+            elif re.search(r"3[,\.]00\s*%", up):
+                tot["perc_30"] += amount
+            else:
+                tot["perc_qr3337"] += amount
+            continue
+
+        if "CARGO TERMINAL FISERV" in up or "CARGO" in up and "TERMINAL" in up and "FISERV" in up:
+            tot["gasto_fiserv"] += amount
+            continue
+
+        # IVA débito/crédito fiscal. Excluye percepciones/retenciones ya capturadas.
+        if is_iva and not is_perc and not is_ret:
+            if re.search(r"10[,\.]50\s*%|10[,\.]5\s*%|25063|COSTO\s*FINANCIERO", up):
+                tot["iva105"] += amount
+                continue
+            if re.search(r"21[,\.]00\s*%|21\s*%", up) or re.search(r"DTO\s*F\.?OTORG|SERV\.?\s*OPER\.?\s*INT|SIST\s*CUOTAS|ARANCEL", up):
+                tot["iva21"] += amount
+                continue
+
     return {k: round2(v) for k, v in tot.items()}
 
 
@@ -349,12 +483,18 @@ def extract_resumen_from_bytes(pdf_bytes: bytes) -> pd.DataFrame:
         for page in pdf.pages:
             text = (page.extract_text() or "").replace("\xa0", " ").replace("−", "-")
             page_cabal = extract_cabal_exact(text)
+            page_uni = extract_universal(text)
+
             if any(v != 0.0 for v in page_cabal.values()):
                 saw_cabal = True
                 for k in cabal_tot:
                     cabal_tot[k] += page_cabal[k]
+
+                # En páginas Cabal no sumamos IVA/percepción IVA universal para no duplicar.
+                # Sí rescatamos conceptos que Cabal exacto no cubre.
+                for k in ("perc_iibb", "gasto_fiserv", "ret_iva", "ret_gcias"):
+                    uni_tot[k] += page_uni.get(k, 0.0)
             else:
-                page_uni = extract_universal(text)
                 for k in uni_tot:
                     uni_tot[k] += page_uni[k]
 
@@ -609,12 +749,18 @@ def build_report_pdf(resumen_df: pd.DataFrame, out_path: str, titulo: str, agreg
 
     data = [["Concepto", "Monto ($)"]]
     total_general = 0.0
-    for _, row in resumen_df.iterrows():
-        val = float(row["Monto Total"])
-        total_general += val
-        data.append([str(row["Concepto"]), format_money(val)])
+    already_has_total = False
 
-    if agregar_total_general:
+    for _, row in resumen_df.iterrows():
+        concepto = str(row["Concepto"])
+        val = float(row["Monto Total"])
+        if concepto.strip().upper() == "TOTAL":
+            already_has_total = True
+        else:
+            total_general += val
+        data.append([concepto, format_money(val)])
+
+    if agregar_total_general and not already_has_total:
         data.append(["TOTAL GENERAL", format_money(total_general)])
 
     tbl = Table(data, colWidths=[360, 140])
