@@ -423,6 +423,11 @@ def get_amount(resumen_df: pd.DataFrame, concepto: str) -> float:
 
 # ============ Resumen operativo agrupado ============
 def build_resumen_operativo_agrupado(resumen_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Vista operativa para pantalla/PDF: separa neto e IVA para que el control
+    sea legible sin mezclar base + impuesto.
+    El Excel de detalle operativo conserva todos los movimientos por archivo.
+    """
     if resumen_df is None or resumen_df.empty:
         return pd.DataFrame(columns=["Concepto", "Monto Total"])
 
@@ -430,9 +435,11 @@ def build_resumen_operativo_agrupado(resumen_df: pd.DataFrame) -> pd.DataFrame:
         return get_amount(resumen_df, concepto)
 
     rows = [
-        {"Concepto": "Gasto al 21%", "Monto Total": round2(total("Base Neto 21%") + total("IVA 21% (Total)"))},
-        {"Concepto": "Gasto al 10,5%", "Monto Total": round2(total("Base Neto 10,5%") + total("IVA 10,5% (Total)"))},
-        {"Concepto": "Gastos exentos", "Monto Total": total("Gastos Exentos")},
+        {"Concepto": "Neto al 21%", "Monto Total": total("Base Neto 21%")},
+        {"Concepto": "IVA al 21%", "Monto Total": total("IVA 21% (Total)")},
+        {"Concepto": "Neto al 10,5%", "Monto Total": total("Base Neto 10,5%")},
+        {"Concepto": "IVA al 10,5%", "Monto Total": total("IVA 10,5% (Total)")},
+        {"Concepto": "Exentos", "Monto Total": total("Gastos Exentos")},
         {"Concepto": "Percepción IVA", "Monto Total": total("Percepciones IVA (Total)")},
         {"Concepto": "Percepción IIBB", "Monto Total": total("Percepciones IIBB")},
         {"Concepto": "Retención IVA", "Monto Total": total("Retenciones IVA")},
@@ -441,6 +448,14 @@ def build_resumen_operativo_agrupado(resumen_df: pd.DataFrame) -> pd.DataFrame:
     ]
     out = pd.DataFrame(rows)
     out = out[out["Monto Total"].round(2) != 0].reset_index(drop=True)
+
+    if not out.empty:
+        total_general = round2(out["Monto Total"].sum())
+        out = pd.concat([
+            out,
+            pd.DataFrame([{"Concepto": "TOTAL", "Monto Total": total_general}]),
+        ], ignore_index=True)
+
     return out
 
 
