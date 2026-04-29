@@ -145,55 +145,58 @@ def detect_bank_from_bytes(pdf_bytes: bytes, filename: str = "") -> dict:
 
 def extract_period_from_text(text: str) -> dict:
     """
-    Devuelve:
-    - fecha_emision: último día del período detectado, o fecha actual.
-    - suc: MMYY para usar como punto de comprobante.
-    - periodo_label: texto del período detectado.
+    Usa como fecha del comprobante la última fecha válida que aparece en el resumen.
+    Además arma Suc. como MMYY desde esa misma fecha.
     """
-    clean = re.sub(r"\s+", " ", text or " ").upper()
-
-    patterns = [
-        r"PER[IÍ]ODO\s*(?:DESDE)?\s*(\d{1,2}/\d{1,2}/\d{2,4})\s*(?:AL|A|HASTA|-)\s*(\d{1,2}/\d{1,2}/\d{2,4})",
-        r"PER[IÍ]ODO\s*[:\-]?\s*(\d{1,2}/\d{1,2}/\d{2,4})\s*(?:AL|A|HASTA|-)\s*(\d{1,2}/\d{1,2}/\d{2,4})",
-        r"DESDE\s*(\d{1,2}/\d{1,2}/\d{2,4})\s*(?:AL|A|HASTA)\s*(\d{1,2}/\d{1,2}/\d{2,4})",
-        r"CIERRE\s*(?:DE\s*)?(?:LOTE|PRESENTACI[ÓO]N|RESUMEN)?[^\d]{0,20}(\d{1,2}/\d{1,2}/\d{2,4})",
-        r"FECHA\s*(?:DE\s*)?(?:CIERRE|RESUMEN)[^\d]{0,20}(\d{1,2}/\d{1,2}/\d{2,4})",
-    ]
+    raw = text or ""
+    clean = re.sub(r"\s+", " ", raw).upper()
 
     def parse_date(s):
         for fmt in ("%d/%m/%Y", "%d/%m/%y"):
             try:
-                return datetime.datetime.strptime(s, fmt).date()
+                d = datetime.datetime.strptime(s, fmt).date()
+                if 2000 <= d.year <= 2099:
+                    return d
             except ValueError:
                 pass
         return None
 
-    for pat in patterns:
-        m = re.search(pat, clean, flags=re.IGNORECASE)
-        if not m:
-            continue
-        if len(m.groups()) >= 2:
-            d1 = parse_date(m.group(1))
-            d2 = parse_date(m.group(2))
-            date_ref = d2 or d1
-            label = f"{m.group(1)} al {m.group(2)}"
-        else:
-            date_ref = parse_date(m.group(1))
-            label = m.group(1)
-        if date_ref:
-            return {
-                "fecha_emision": date_ref.strftime("%d/%m/%Y"),
-                "suc": date_ref.strftime("%m%y"),
-                "periodo_label": label,
-            }
+    date_matches = list(re.finditer(r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b", clean))
+    fechas_validas = []
+    for m in date_matches:
+        d = parse_date(m.group(1))
+        if d:
+            fechas_validas.append((m.start(), m.group(1), d))
+
+    if fechas_validas:
+        _, fecha_texto, date_ref = fechas_validas[-1]
+        periodo_label = date_ref.strftime("%m/%Y")
+
+        period_patterns = [
+            r"PER[IÍ]ODO\s*(?:DESDE)?\s*(\d{1,2}/\d{1,2}/\d{2,4})\s*(?:AL|A|HASTA|-)\s*(\d{1,2}/\d{1,2}/\d{2,4})",
+            r"PER[IÍ]ODO\s*[:\-]?\s*(\d{1,2}/\d{1,2}/\d{2,4})\s*(?:AL|A|HASTA|-)\s*(\d{1,2}/\d{1,2}/\d{2,4})",
+            r"DESDE\s*(\d{1,2}/\d{1,2}/\d{2,4})\s*(?:AL|A|HASTA)\s*(\d{1,2}/\d{1,2}/\d{2,4})",
+        ]
+        for pat in period_patterns:
+            m = re.search(pat, clean, flags=re.IGNORECASE)
+            if m:
+                periodo_label = f"{m.group(1)} al {m.group(2)}"
+                break
+
+        return {
+            "fecha_emision": date_ref.strftime("%d/%m/%Y"),
+            "suc": date_ref.strftime("%m%y"),
+            "periodo_label": periodo_label,
+            "fecha_detectada_texto": fecha_texto,
+        }
 
     today = datetime.date.today()
     return {
         "fecha_emision": today.strftime("%d/%m/%Y"),
         "suc": today.strftime("%m%y"),
         "periodo_label": today.strftime("%m/%Y"),
+        "fecha_detectada_texto": "",
     }
-
 
 def extract_file_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
     text = read_pdf_text_from_bytes(pdf_bytes)
@@ -418,12 +421,35 @@ def get_amount(resumen_df: pd.DataFrame, concepto: str) -> float:
     return round2(resumen_df.loc[mask, "Monto Total"].sum())
 
 
+# ============ Resumen operativo agrupado ============
+def build_resumen_operativo_agrupado(resumen_df: pd.DataFrame) -> pd.DataFrame:
+    if resumen_df is None or resumen_df.empty:
+        return pd.DataFrame(columns=["Concepto", "Monto Total"])
+
+    def total(concepto: str) -> float:
+        return get_amount(resumen_df, concepto)
+
+    rows = [
+        {"Concepto": "Gasto al 21%", "Monto Total": round2(total("Base Neto 21%") + total("IVA 21% (Total)"))},
+        {"Concepto": "Gasto al 10,5%", "Monto Total": round2(total("Base Neto 10,5%") + total("IVA 10,5% (Total)"))},
+        {"Concepto": "Gastos exentos", "Monto Total": total("Gastos Exentos")},
+        {"Concepto": "Percepción IVA", "Monto Total": total("Percepciones IVA (Total)")},
+        {"Concepto": "Percepción IIBB", "Monto Total": total("Percepciones IIBB")},
+        {"Concepto": "Retención IVA", "Monto Total": total("Retenciones IVA")},
+        {"Concepto": "Retención IIBB", "Monto Total": total("Retenciones IBB")},
+        {"Concepto": "Retención Ganancias", "Monto Total": total("Retenciones Ganancias")},
+    ]
+    out = pd.DataFrame(rows)
+    out = out[out["Monto Total"].round(2) != 0].reset_index(drop=True)
+    return out
+
+
 # ============ Holistor compras ============
 def _base_invoice_row(meta: dict, secuencia: int) -> dict:
     return {
         "Fecha Emisión ": meta.get("fecha_emision", ""),
         "Fecha Recepción": meta.get("fecha_emision", ""),
-        "Cpbte": "FC",
+        "Cpbte": "RB",
         "Tipo": "A",
         "Suc.": meta.get("suc", ""),
         "Número": str(secuencia).zfill(8),
