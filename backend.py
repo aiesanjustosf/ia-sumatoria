@@ -375,8 +375,9 @@ def _amount_from_line(line: str) -> float:
 
     amount = vals[-1]
 
-    # Si el importe ya viene firmado, se respeta.
-    # Ej.: "- ARANCEL $ 138,24-" debe computarse como -138,24.
+    # Devuelve el signo real del importe.
+    # Luego extract_tax_lines() convierte a valor absoluto porque el resumen
+    # operativo busca gastos, no flujo financiero de pagos.
     if amount < 0:
         return amount
 
@@ -432,7 +433,12 @@ def extract_tax_lines(text: str) -> dict:
         if not up or not _line_amounts(line):
             continue
 
-        amount = _amount_from_line(line)
+        # Resumen operativo de GASTOS:
+        # en estos resúmenes las contrapartidas pueden venir con importe negativo
+        # (ej.: ARANCEL $ 138,24- / IVA $ 29,03-), pero para el control de
+        # gastos deben computarse como gasto igualmente. Por eso usamos valor
+        # absoluto para clasificar importes fiscales/operativos.
+        amount = abs(_amount_from_line(line))
 
         is_iva = bool(re.search(r"\bIVA\b|I\.V\.A", up))
         is_perc = bool(re.search(r"PERCEPCI[ÓO]N|PERCEP\.?|PERC\.?", up))
@@ -488,7 +494,7 @@ def extract_tax_lines(text: str) -> dict:
             add("iva105", amount, up)
             vals = _line_amounts(line)
             if len(vals) >= 2:
-                add("base105_direct", vals[0], up, dedupe_amount=False)
+                add("base105_direct", abs(vals[0]), up, dedupe_amount=False)
             continue
 
         if is_iva and (
@@ -498,7 +504,7 @@ def extract_tax_lines(text: str) -> dict:
             add("iva21", amount, up)
             vals = _line_amounts(line)
             if len(vals) >= 2:
-                add("base21_direct", vals[0], up, dedupe_amount=False)
+                add("base21_direct", abs(vals[0]), up, dedupe_amount=False)
             continue
 
     # Resúmenes mensuales Visa/Credicoop: el resumen trae el bloque exacto
