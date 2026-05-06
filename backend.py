@@ -83,17 +83,38 @@ CONCEPT_ORDER = [
 
 # ============ Utils ============
 def to_float_signed(s: str) -> float:
+    """
+    Convierte importes argentinos conservando el signo real del importe.
+
+    Soporta estos formatos:
+      1.234,56
+      -1.234,56
+      1.234,56-
+      (1.234,56)
+      $ 1.234,56
+      $ 1.234,56-
+
+    Importante: el guion inicial de las líneas tipo "- ARANCEL $ 100,00"
+    es viñeta/concepto del resumen, no signo del importe. El signo se toma
+    del texto capturado como importe, no del comienzo de la descripción.
+    """
     s = (s or "").strip().replace("−", "-").replace("$", "").replace(" ", "")
     if not s:
         return 0.0
 
     neg = False
+
     if s.startswith("(") and s.endswith(")"):
         neg = True
         s = s[1:-1]
+
     if s.startswith("-"):
         neg = True
         s = s[1:]
+
+    if s.endswith("-"):
+        neg = True
+        s = s[:-1]
 
     if not s:
         return 0.0
@@ -322,18 +343,21 @@ def extract_card_documents_from_bytes(pdf_bytes: bytes, filename: str = "") -> l
 # ============ Extracción de importes ============
 AMOUNT_RE = re.compile(
     r"(?<![\d/])"
-    r"\(?[-−]?\s*\$?\s*\d{1,3}(?:\.\d{3})*,\d{2}\)?"
+    # Importe con signo adelante opcional, $ opcional y signo final opcional.
+    # El signo final es frecuente en contrapartidas: 138,24-
+    r"\(?[-−]?\s*\$?\s*\d{1,3}(?:\.\d{3})*,\d{2}\s*[-−]?\)?"
     r"(?!\s*%)(?![/\d])"
 )
 
 
 def _line_amounts(line: str) -> list[float]:
     # Quita porcentajes para que 21,00% / 3,00% no se tomen como importes.
+    # Conserva el signo propio del importe, por ejemplo 138,24-.
     clean_line = re.sub(r"\d+(?:[.,]\d+)?\s*%", " ", line or "")
     vals = []
     for m in AMOUNT_RE.finditer(clean_line):
         try:
-            vals.append(abs(to_float_signed(m.group(0))))
+            vals.append(to_float_signed(m.group(0)))
         except Exception:
             continue
     return vals
@@ -346,7 +370,18 @@ def _is_reversal(line: str) -> bool:
 
 def _amount_from_line(line: str) -> float:
     vals = _line_amounts(line)
-    amount = vals[-1] if vals else 0.0
+    if not vals:
+        return 0.0
+
+    amount = vals[-1]
+
+    # Si el importe ya viene firmado, se respeta.
+    # Ej.: "- ARANCEL $ 138,24-" debe computarse como -138,24.
+    if amount < 0:
+        return amount
+
+    # Si no viene firmado, solo se invierte cuando la descripción indica
+    # reverso/devolución/ajuste a favor.
     return -amount if _is_reversal(line) else amount
 
 
@@ -428,6 +463,18 @@ def extract_tax_lines(text: str) -> dict:
                 add("base21_direct", amount, up)
                 continue
             if re.search(r"ARANCEL\s+DE\s+DESCUENTO|DTO\.?\s*ARANCEL|DTO\s*F\.?OTORG|SERV\.?\s*OPER\.?\s*INT|SIST\s*CUOTAS", up):
+                add("base21_direct", amount, up)
+                continue
+
+            # Fiserv / Visa / NBSF: descuento financiero del adquirente.
+            # Es gasto gravado al 21% y suele venir separado de su IVA:
+            #   - DTO S/VENTAS FIN ADQ CONT $ 953,05
+            #   - IVA S/DTO FIN ADQ CONT 21,00% $ 200,14
+            #   - DTO S/VENTAS FIN ADQ CUOTA $ 5.758,98
+            #   - IVA S/DTO FIN ADQ CUOTA 21,00% $ 1.209,38
+            # Se exige que la línea empiece con DTO para no confundirlo con
+            # "+ VENTAS C/DTO ANTIC...", que es venta presentada y no gasto.
+            if re.search(r"^\s*[-+]?\s*DTO\s*S\s*/?\s*VENTAS\s*FIN\s*ADQ\b", up):
                 add("base21_direct", amount, up)
                 continue
             if re.search(r"CARGO\s*TERMINAL|FISERV|GASTOS?\s*EXENT|SELLADO|SEGURO|MANTENIMIENTO\s*TERMINAL", up):
